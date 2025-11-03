@@ -822,5 +822,49 @@ KIJ-203 (Turborepo) ← START HERE (BLOCKER)
 
 ---
 
-**Last Updated:** 2025-11-03 14:00 UTC+01:00  
-**Next Review:** After Phase 1 completion
+## 🎤 Voice Chat Widget Implementation (Nov 3, 2025 - 11:40pm)
+
+### Completed ✅
+1. **Extracted working voice agent** from previous implementation
+2. **Created Zustand store** for voice chat state (`voiceChatStore.ts`)
+3. **Implemented Gemini Live voice service** (`geminiVoiceService.ts`)
+   - Real-time audio streaming with resampling (48kHz → 16kHz)
+   - Live transcription (input + output)
+   - Error recovery with exponential backoff
+   - Proper cleanup on disconnect
+4. **Built floating voice chat widget** (`VoiceChatWidget.tsx`)
+   - Portal-based rendering for global availability
+   - Minimize/maximize functionality
+   - Text chat fallback
+   - State persists across navigation
+5. **Integrated into root layout** - appears on all pages
+
+### Features
+- 🎙️ Real-time voice conversation with Gemini 2.5 Flash Native Audio
+- 💬 Live transcription display (user + agent)
+- ✍️ Text chat fallback when voice unavailable
+- 📍 Floating mic button (bottom-right corner)
+- 🔄 State persistence via Zustand
+- 🔁 Automatic retry on connection failure
+- 🧹 Proper resource cleanup
+
+### Files Created
+- `/apps/OpenCut/apps/web/src/stores/voiceChatStore.ts`
+- `/apps/OpenCut/apps/web/src/services/geminiVoiceService.ts`
+- `/apps/OpenCut/apps/web/src/components/VoiceChatWidget.tsx`
+
+### Dependencies Added
+- `zustand` (state management)
+- `@google/genai` (Gemini Live API)
+
+### Next Steps
+- [ ] Add `NEXT_PUBLIC_GEMINI_API_KEY` to `.env.local`
+- [ ] Test voice conversation on dashboard
+- [ ] Integrate voice agent with video editor timeline
+- [ ] Add tool calling for video editing commands via voice
+- [ ] Connect voice agent to Agent Builder database
+
+---
+
+**Last Updated:** 2025-11-03 23:40 UTC+01:00  
+**Next Review:** After voice chat testing
