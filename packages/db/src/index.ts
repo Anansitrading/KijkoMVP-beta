@@ -1,23 +1,35 @@
-import { drizzle } from "drizzle-orm/postgres-js";
-import postgres from "postgres";
+import { drizzle } from "drizzle-orm/node-postgres";
+import { Pool } from "pg";
 import * as schema from "./schema";
-import { keys } from "./keys";
 
-const { DATABASE_URL } = keys();
-// Create a lazy database instance that only initializes when accessed
-let _db: ReturnType<typeof drizzle> | null = null;
+// Use a global variable to avoid creating multiple pool instances in dev (hot reload)
+const globalForPg = global as unknown as { pgPool?: Pool };
 
-function getDb() {
-  if (!_db) {
-    const client = postgres(DATABASE_URL);
-    _db = drizzle(client, { schema });
-  }
+// Get DATABASE_URL from environment
+const DATABASE_URL = process.env.DATABASE_URL || "postgresql://opencut:opencutthegoat@localhost:5432/opencut";
 
-  return _db;
+if (!DATABASE_URL) {
+  throw new Error("DATABASE_URL environment variable is not set");
 }
 
-// Export a proxy that forwards all calls to the actual db instance
-export const db = getDb();
+// Create or reuse pg Pool
+export const pgPool =
+  globalForPg.pgPool ||
+  new Pool({
+    connectionString: DATABASE_URL,
+    max: 10, // Maximum number of clients in the pool
+  });
+
+if (process.env.NODE_ENV !== "production") {
+  globalForPg.pgPool = pgPool;
+}
+
+// Initialize Drizzle with pg Pool and schema
+// Enable logging in development
+export const db = drizzle(pgPool, { 
+  schema,
+  logger: process.env.NODE_ENV !== "production"
+});
 
 // Re-export schema for convenience
 export * from "./schema";

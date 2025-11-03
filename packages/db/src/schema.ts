@@ -1,4 +1,15 @@
-import { pgTable, text, timestamp, boolean } from "drizzle-orm/pg-core";
+import { 
+  pgTable, 
+  text, 
+  timestamp, 
+  boolean, 
+  uuid, 
+  integer, 
+  jsonb, 
+  vector,
+  index,
+  primaryKey
+} from "drizzle-orm/pg-core";
 
 export const users = pgTable("users", {
   id: text("id").primaryKey(),
@@ -68,3 +79,79 @@ export const exportWaitlist = pgTable("export_waitlist", {
     .$defaultFn(() => /* @__PURE__ */ new Date())
     .notNull(),
 }).enableRLS();
+
+// ============================================
+// Agent Builder Schema (Voice-Enabled)
+// ============================================
+
+export const agents = pgTable("agents", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  name: text("name").notNull().unique(),
+  description: text("description"),
+  systemPrompt: text("system_prompt").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
+  isActive: boolean("is_active").default(true),
+  createdBy: uuid("created_by").notNull(),
+  createdVia: text("created_via").default("voice"),
+});
+
+export const agentVersions = pgTable("agent_versions", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  agentId: uuid("agent_id").notNull().references(() => agents.id, { onDelete: "cascade" }),
+  version: integer("version").notNull(),
+  systemPrompt: text("system_prompt").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
+  createdBy: uuid("created_by"),
+  notes: text("notes"),
+});
+
+export const tools = pgTable("tools", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  name: text("name").notNull().unique(),
+  type: text("type").notNull(), // 'rest', 'graphql', 'playwright', 'instruction_set', 'langchain'
+  description: text("description").notNull(),
+  config: jsonb("config").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
+  isActive: boolean("is_active").default(true),
+  version: integer("version").default(1),
+  embedding: vector("embedding", { dimensions: 1536 }),
+});
+
+export const toolCredentials = pgTable("tool_credentials", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  toolId: uuid("tool_id").notNull().references(() => tools.id, { onDelete: "cascade" }),
+  credentialType: text("credential_type").notNull(), // 'api_key', 'oauth', 'basic_auth', 'playwright_login'
+  secretRef: text("secret_ref").notNull(), // Reference to secret manager
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
+});
+
+export const agentTools = pgTable("agent_tools", {
+  agentId: uuid("agent_id").notNull().references(() => agents.id, { onDelete: "cascade" }),
+  toolId: uuid("tool_id").notNull().references(() => tools.id, { onDelete: "cascade" }),
+  toolVersion: integer("tool_version").default(1),
+  addedAt: timestamp("added_at", { withTimezone: true }).defaultNow(),
+  addedBy: uuid("added_by"),
+}, (table) => ({
+  pk: primaryKey({ columns: [table.agentId, table.toolId] }),
+}));
+
+export const agentExamples = pgTable("agent_examples", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  agentId: uuid("agent_id").notNull().references(() => agents.id, { onDelete: "cascade" }),
+  input: text("input").notNull(),
+  expectedOutput: text("expected_output").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
+});
+
+export const agentAudit = pgTable("agent_audit", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  agentId: uuid("agent_id").references(() => agents.id, { onDelete: "cascade" }),
+  event: text("event").notNull(),
+  details: jsonb("details"),
+  performedBy: uuid("performed_by"),
+  performedAt: timestamp("performed_at", { withTimezone: true }).defaultNow(),
+});
+
+// Note: Indexes will be created via SQL migration for better control

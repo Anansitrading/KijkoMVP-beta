@@ -2473,7 +2473,464 @@ export class WorkflowDiscovery {
 
 ---
 
-## Phase 4: AI Agent Orchestration (Days 15-18)
+## Phase 4: AI Agent Orchestration (Days 15-22)
+
+### Strategic Role of Langfuse: Dual-Purpose Platform
+
+**Langfuse serves TWO critical functions in Kijko:**
+
+1. **Developer Observability** (Internal Telemetry)
+   - Multi-agent workflow tracing (VRD → ScriptSmith → ShotMaster chains)
+   - Cost attribution per agent (track when AI Concept Generator creates 100 concepts)
+   - Decision point analysis and failure dataset creation
+   - Regression testing using datasets from production failures
+
+2. **User-Facing Prompt Optimization** (Product Feature)
+   - Prompt management and versioning for all AI interactions
+   - A/B testing of prompt variations for ComfyUI workflows
+   - Automated prompt optimization through experiments SDK
+   - Community-driven prompt template marketplace
+
+**Architecture Pattern:**
+- **Langfuse**: Source of truth for prompts, versions, A/B tests, evaluations
+- **PostgreSQL**: Cache prompt metadata + references to Langfuse prompt IDs
+- **Client-side**: Use Langfuse SDK caching to avoid latency
+
+### 4.1 Voice-Enabled Agent Builder - Core Architecture
+
+**Critical Feature:** Users create custom AI agents via voice/natural language with full transparency into system prompts and tools.
+
+**Database Schema (with Full Transparency):**
+
+```sql
+-- Core Agents Table
+CREATE TABLE agents (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name TEXT NOT NULL UNIQUE,
+  description TEXT,
+  system_prompt TEXT NOT NULL,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  is_active BOOLEAN DEFAULT TRUE,
+  created_by UUID NOT NULL,  -- FK to users
+  created_via TEXT DEFAULT 'voice',  -- 'voice', 'ui', 'api'
+  CONSTRAINT agents_name_key UNIQUE (name)
+);
+
+-- Agent System Prompt Versions (for rollback)
+CREATE TABLE agent_versions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  agent_id UUID REFERENCES agents(id) ON DELETE CASCADE,
+  version INTEGER NOT NULL,
+  system_prompt TEXT NOT NULL,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  created_by UUID,
+  notes TEXT,
+  UNIQUE(agent_id, version)
+);
+
+-- Tools Table (Dynamic Registration)
+CREATE TABLE tools (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name TEXT NOT NULL UNIQUE,
+  type TEXT NOT NULL,  -- 'rest', 'graphql', 'playwright', 'instruction_set', 'langchain'
+  description TEXT NOT NULL,
+  config JSONB NOT NULL,  -- Contains endpoint, schema, NOT raw credentials
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  is_active BOOLEAN DEFAULT TRUE,
+  version INTEGER DEFAULT 1,
+  embedding VECTOR(1536)  -- For RAG tool discovery
+);
+
+-- Tool Credentials (Secure Reference Only)
+CREATE TABLE tool_credentials (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tool_id UUID REFERENCES tools(id) ON DELETE CASCADE,
+  credential_type TEXT NOT NULL,  -- 'api_key', 'oauth', 'basic_auth', 'playwright_login'
+  secret_ref TEXT NOT NULL,  -- Reference to secret manager (e.g., 'vault:playwright_mcp_123')
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  UNIQUE(tool_id, credential_type)
+);
+
+-- Agent-Tool Mapping (Which agents have which tools)
+CREATE TABLE agent_tools (
+  agent_id UUID REFERENCES agents(id) ON DELETE CASCADE,
+  tool_id UUID REFERENCES tools(id) ON DELETE CASCADE,
+  tool_version INTEGER DEFAULT 1,
+  added_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  added_by UUID,  -- User or 'system'
+  PRIMARY KEY (agent_id, tool_id)
+);
+
+-- Agent Examples (for few-shot learning)
+CREATE TABLE agent_examples (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  agent_id UUID REFERENCES agents(id) ON DELETE CASCADE,
+  input TEXT NOT NULL,
+  expected_output TEXT NOT NULL,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Agent Audit Log (Full transparency)
+CREATE TABLE agent_audit (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  agent_id UUID REFERENCES agents(id) ON DELETE CASCADE,
+  event TEXT NOT NULL,  -- 'created', 'prompt_updated', 'tool_added', 'tool_removed', 'executed'
+  details JSONB,
+  performed_by UUID,
+  performed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Indexes for performance
+CREATE INDEX idx_agents_active ON agents(is_active, created_at DESC);
+CREATE INDEX idx_tools_active ON tools(is_active, type);
+CREATE INDEX idx_tools_embedding ON tools USING ivfflat (embedding vector_cosine_ops);
+CREATE INDEX idx_agent_tools_agent ON agent_tools(agent_id);
+CREATE INDEX idx_agent_tools_tool ON agent_tools(tool_id);
+```
+
+**Voice-Enabled Agent Creation Flow (Conversational):**
+
+```typescript
+// packages/ai/agent-builder/voice-flow.ts
+import { StateGraph } from 'langgraph/web';
+import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
+
+interface AgentBuilderState {
+  step: 'greeting' | 'name' | 'purpose' | 'prompt' | 'tools' | 'confirmation' | 'done';
+  name?: string;
+  description?: string;
+  systemPrompt?: string;
+  selectedTools?: string[];  // tool IDs
+  userInput?: string;
+  errors?: string[];
+}
+
+export class VoiceAgentBuilder {
+  private llm: ChatGoogleGenerativeAI;
+  private graph: StateGraph<AgentBuilderState>;
+
+  constructor() {
+    this.llm = new ChatGoogleGenerativeAI({
+      model: 'gemini-2.0-flash-exp',
+      streaming: true
+    });
+
+    this.buildGraph();
+  }
+
+  private buildGraph() {
+    const graph = new StateGraph<AgentBuilderState>({
+      channels: {
+        step: { default: () => 'greeting' },
+        name: { default: () => undefined },
+        description: { default: () => undefined },
+        systemPrompt: { default: () => undefined },
+        selectedTools: { default: () => [] },
+        userInput: { default: () => undefined },
+        errors: { default: () => [] }
+      }
+    });
+
+    // 1. Greeting
+    graph.addNode('greeting', async (state) => {
+      return {
+        step: 'name',
+        userInput: 'Would you like to create a new AI agent? What should we call it?'
+      };
+    });
+
+    // 2. Collect agent name
+    graph.addNode('name', async (state) => {
+      const name = state.userInput?.trim();
+      
+      // Validate name is unique
+      const exists = await db.agents.findFirst({ where: { name } });
+      if (exists) {
+        return {
+          step: 'name',
+          errors: ['That name is taken. Please choose another.']
+        };
+      }
+
+      return {
+        step: 'purpose',
+        name,
+        userInput: `Great! What should ${name} do? Describe its main purpose.`
+      };
+    });
+
+    // 3. Gather purpose and generate system prompt
+    graph.addNode('purpose', async (state) => {
+      const description = state.userInput;
+
+      // LLM generates system prompt from description
+      const promptGeneration = await this.llm.invoke([
+        {
+          role: 'system',
+          content: `You are an expert at writing AI agent system prompts.
+            Generate a clear, concise system prompt for an agent that: ${description}`
+        },
+        {
+          role: 'user',
+          content: 'Generate the system prompt now.'
+        }
+      ]);
+
+      return {
+        step: 'prompt',
+        description,
+        systemPrompt: promptGeneration.content,
+        userInput: `I've drafted this system prompt:\n\n"${promptGeneration.content}"\n\nWould you like to customize it, or should we proceed?`
+      };
+    });
+
+    // 4. Tool selection via RAG
+    graph.addNode('tools', async (state) => {
+      // Semantic search for relevant tools
+      const toolSuggestions = await this.discoverTools(state.description!);
+
+      return {
+        step: 'confirmation',
+        selectedTools: toolSuggestions.map(t => t.id),
+        userInput: `I recommend these tools for ${state.name}:\n${toolSuggestions.map(t => `- ${t.name}: ${t.description}`).join('\n')}\n\nShould I add all of these, or would you like to customize?`
+      };
+    });
+
+    // 5. Confirmation and save
+    graph.addNode('confirmation', async (state) => {
+      // Save to database
+      const agent = await db.agents.create({
+        data: {
+          name: state.name!,
+          description: state.description!,
+          systemPrompt: state.systemPrompt!,
+          createdBy: 'current-user-id',
+          createdVia: 'voice'
+        }
+      });
+
+      // Link tools
+      await db.agentTools.createMany({
+        data: state.selectedTools!.map(toolId => ({
+          agentId: agent.id,
+          toolId,
+          addedBy: 'current-user-id'
+        }))
+      });
+
+      // Create version history
+      await db.agentVersions.create({
+        data: {
+          agentId: agent.id,
+          version: 1,
+          systemPrompt: state.systemPrompt!,
+          createdBy: 'current-user-id',
+          notes: 'Initial version created via voice'
+        }
+      });
+
+      // Audit log
+      await db.agentAudit.create({
+        data: {
+          agentId: agent.id,
+          event: 'created',
+          details: { via: 'voice', tools: state.selectedTools },
+          performedBy: 'current-user-id'
+        }
+      });
+
+      return {
+        step: 'done',
+        userInput: `✅ ${state.name} is ready! Would you like to test it now?`
+      };
+    });
+
+    // Add edges
+    graph.addEdge('greeting', 'name');
+    graph.addEdge('name', 'purpose');
+    graph.addEdge('purpose', 'prompt');
+    graph.addEdge('prompt', 'tools');
+    graph.addEdge('tools', 'confirmation');
+
+    graph.setEntryPoint('greeting');
+    graph.setFinishPoint('done');
+
+    this.graph = graph.compile();
+  }
+
+  private async discoverTools(description: string): Promise<Tool[]> {
+    // Generate embedding for description
+    const embedding = await generateEmbedding(description);
+
+    // Vector similarity search in tools table
+    const tools = await db.$queryRaw`
+      SELECT id, name, description, type, config,
+             1 - (embedding <=> ${embedding}::vector) as similarity
+      FROM tools
+      WHERE is_active = true
+      ORDER BY embedding <=> ${embedding}::vector
+      LIMIT 5
+    `;
+
+    return tools;
+  }
+
+  async processVoiceInput(userInput: string, currentState: AgentBuilderState) {
+    return this.graph.invoke({ ...currentState, userInput });
+  }
+}
+```
+
+**Tool Registration API:**
+
+```typescript
+// apps/web/src/app/api/tools/register/route.ts
+export async function POST(req: Request) {
+  const { name, type, description, config, credentials } = await req.json();
+
+  // 1. Validate tool config
+  if (!name || !type || !description) {
+    return NextResponse.json({ error: 'Missing required fields' }, { status: 400 });
+  }
+
+  // 2. Generate embedding for RAG discovery
+  const embedding = await generateEmbedding(description);
+
+  // 3. Save tool (WITHOUT raw credentials)
+  const tool = await db.tools.create({
+    data: {
+      name,
+      type,
+      description,
+      config,
+      embedding
+    }
+  });
+
+  // 4. If credentials provided, store in secret manager
+  if (credentials) {
+    const secretRef = await storeCredentials(tool.id, credentials);
+    
+    await db.toolCredentials.create({
+      data: {
+        toolId: tool.id,
+        credentialType: credentials.type,
+        secretRef  // e.g., 'vault:playwright_mcp_123'
+      }
+    });
+  }
+
+  // 5. Audit log
+  await db.agentAudit.create({
+    data: {
+      agentId: null,
+      event: 'tool_registered',
+      details: { toolId: tool.id, name, type },
+      performedBy: 'current-user-id'
+    }
+  });
+
+  return NextResponse.json({ success: true, tool });
+}
+```
+
+**Agent Inspector Component (Full Transparency):**
+
+```typescript
+// apps/web/src/components/agents/AgentInspector.tsx
+import { Card } from '@/components/ui/card';
+import { Badge } from '@/components/ui/badge';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+
+export function AgentInspector({ agentId }: { agentId: string }) {
+  const { data: agent } = useQuery({
+    queryKey: ['agent', agentId],
+    queryFn: () => fetch(`/api/agents/${agentId}`).then(r => r.json())
+  });
+
+  const { data: tools } = useQuery({
+    queryKey: ['agent-tools', agentId],
+    queryFn: () => fetch(`/api/agents/${agentId}/tools`).then(r => r.json())
+  });
+
+  const { data: versions } = useQuery({
+    queryKey: ['agent-versions', agentId],
+    queryFn: () => fetch(`/api/agents/${agentId}/versions`).then(r => r.json())
+  });
+
+  return (
+    <Card className="p-6">
+      <div className="space-y-6">
+        <div>
+          <h2 className="text-2xl font-bold">{agent?.name}</h2>
+          <p className="text-muted-foreground">{agent?.description}</p>
+          <Badge variant="secondary" className="mt-2">
+            Created via {agent?.createdVia}
+          </Badge>
+        </div>
+
+        <Tabs defaultValue="prompt">
+          <TabsList>
+            <TabsTrigger value="prompt">System Prompt</TabsTrigger>
+            <TabsTrigger value="tools">Tools ({tools?.length})</TabsTrigger>
+            <TabsTrigger value="versions">Version History</TabsTrigger>
+          </TabsList>
+
+          <TabsContent value="prompt" className="space-y-4">
+            <div className="bg-muted p-4 rounded-lg font-mono text-sm">
+              {agent?.systemPrompt}
+            </div>
+            <Button variant="outline" onClick={() => editPrompt(agent)}>
+              Edit System Prompt
+            </Button>
+          </TabsContent>
+
+          <TabsContent value="tools" className="space-y-4">
+            {tools?.map(tool => (
+              <Card key={tool.id} className="p-4">
+                <div className="flex justify-between items-start">
+                  <div>
+                    <h4 className="font-semibold">{tool.name}</h4>
+                    <p className="text-sm text-muted-foreground">{tool.description}</p>
+                    <Badge variant="outline" className="mt-2">{tool.type}</Badge>
+                  </div>
+                  <Button variant="ghost" size="sm" onClick={() => removeTool(agentId, tool.id)}>
+                    Remove
+                  </Button>
+                </div>
+              </Card>
+            ))}
+            <Button onClick={() => addToolsDialog(agentId)}>
+              + Add Tools
+            </Button>
+          </TabsContent>
+
+          <TabsContent value="versions" className="space-y-4">
+            {versions?.map(version => (
+              <Card key={version.id} className="p-4">
+                <div className="flex justify-between items-center">
+                  <div>
+                    <Badge>v{version.version}</Badge>
+                    <p className="text-sm mt-1">{version.notes}</p>
+                    <p className="text-xs text-muted-foreground">
+                      {new Date(version.createdAt).toLocaleString()}
+                    </p>
+                  </div>
+                  <Button variant="outline" size="sm" onClick={() => rollbackToVersion(version.id)}>
+                    Rollback
+                  </Button>
+                </div>
+              </Card>
+            ))}
+          </TabsContent>
+        </Tabs>
+      </div>
+    </Card>
+  );
+}
+```
 
 ### 4.1 LangGraph Agent Setup
 
@@ -4366,6 +4823,350 @@ async def test_concept_generator_regression():
 - **Regression test datasets** from production failures
 - **Sentry + Langfuse integration** for complete observability
 - **Continuous improvement** based on real production data
+
+---
+
+## Phase 4.5: User-Facing Prompt Management (Days 18-19)
+
+### 4.5.1 Langfuse Prompt Management Integration
+
+**Goal:** Transform Langfuse from pure developer telemetry into a user-facing product feature for systematic prompt optimization.
+
+**Where Langfuse Manages User Prompts:**
+
+1. **ComfyUI Workflow Prompts**
+   - Text-to-video, image-to-video, upscaling workflow prompts
+   - Enable A/B testing of prompt formulations ("cinematic 4K" vs "photorealistic ultra-detailed")
+   - Use Prompt Config to manage model parameters (CFG scale, steps, samplers)
+   - Track which prompt versions produce highest quality outputs
+
+2. **Agent System Prompts**
+   - Store agent instructions in Langfuse (in addition to PostgreSQL `agent_instruction_versions`)
+   - Use Prompt Composability to create modular instructions that reference base templates
+   - Enable users to A/B test agent variations through Workflow Forge UI
+   - Implement version rollback using Langfuse labels (production, staging, latest)
+
+3. **Direct Model Prompts**
+   - Manage prompts for voice generation (Cartesia TTS with Dutch language)
+   - Store prompts for image generation models
+   - Version control audio model instructions
+   - Track performance metrics (latency, cost, user satisfaction)
+
+**Unified Prompt Service Architecture:**
+
+```typescript
+// packages/ai/prompt-service/
+// ├── langfuse-prompts.ts         // Fetch from Langfuse
+// ├── workflow-prompts.ts         // ComfyUI workflow templates  
+// ├── agent-prompts.ts            // Agent instruction templates
+// └── model-prompts.ts            // Direct model API prompts
+
+// packages/ai/prompt-service/langfuse-prompts.ts
+import { Langfuse } from 'langfuse';
+
+export class PromptService {
+  private langfuse: Langfuse;
+  private cache: Map<string, CachedPrompt> = new Map();
+
+  async getPrompt(name: string, version?: string): Promise<Prompt> {
+    // Check cache first
+    const cacheKey = `${name}:${version || 'latest'}`;
+    if (this.cache.has(cacheKey)) {
+      return this.cache.get(cacheKey)!.prompt;
+    }
+
+    // Fetch from Langfuse
+    const prompt = await this.langfuse.getPrompt(name, version);
+
+    // Cache for 5 minutes
+    this.cache.set(cacheKey, {
+      prompt,
+      expires: Date.now() + 5 * 60 * 1000
+    });
+
+    // Also save reference in PostgreSQL
+    await db.promptCache.upsert({
+      name,
+      version: prompt.version,
+      langfusePromptId: prompt.id,
+      updatedAt: new Date()
+    });
+
+    return prompt;
+  }
+
+  async compilePrompt(template: string, variables: Record<string, any>): Promise<string> {
+    // Support Langfuse mustache templates
+    return template.replace(/\{\{(\w+)\}\}/g, (_, key) => variables[key] || '');
+  }
+}
+```
+
+**Database Hybrid Approach:**
+
+```sql
+-- PostgreSQL caches prompt metadata only
+CREATE TABLE prompt_cache (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  langfuse_prompt_id TEXT NOT NULL,  -- Reference to Langfuse
+  category TEXT,                      -- 'workflow', 'agent', 'model'
+  updated_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE(name, version)
+);
+
+-- Langfuse remains source of truth for:
+-- - Actual prompt content
+-- - Version history
+-- - A/B test configurations
+-- - Evaluation results
+```
+
+### 4.5.2 User-Facing Prompt Optimization Features
+
+**1. Prompt Experimentation UI**
+
+Build into Workflow Forge (extending Days 17-18 work):
+
+```typescript
+// apps/web/src/components/forge/PromptExperimentPanel.tsx
+import { useState } from 'react';
+import { Button } from '@/components/ui/button';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+
+export function PromptExperimentPanel({ workflowId }: { workflowId: string }) {
+  const [variants, setVariants] = useState<PromptVariant[]>([]);
+
+  const createVariant = async (basePrompt: string) => {
+    // Create new variant in Langfuse
+    const variant = await fetch('/api/prompts/create-variant', {
+      method: 'POST',
+      body: JSON.stringify({
+        basePrompt,
+        workflowId,
+        label: `variant-${variants.length + 1}`
+      })
+    });
+
+    setVariants([...variants, variant]);
+  };
+
+  const runExperiment = async (testDataset: File) => {
+    // Run each variant on test dataset
+    const results = await Promise.all(
+      variants.map(variant => 
+        fetch('/api/experiments/run', {
+          method: 'POST',
+          body: JSON.stringify({
+            variantId: variant.id,
+            datasetFile: testDataset
+          })
+        })
+      )
+    );
+
+    // Display results side-by-side
+    return results;
+  };
+
+  return (
+    <div className="space-y-4">
+      <h3 className="text-lg font-semibold">Prompt Experiments</h3>
+      
+      <Tabs defaultValue="variants">
+        <TabsList>
+          <TabsTrigger value="variants">Variants</TabsTrigger>
+          <TabsTrigger value="results">Results</TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="variants">
+          {/* Create and edit prompt variants */}
+        </TabsContent>
+
+        <TabsContent value="results">
+          {/* Compare outputs side-by-side */}
+        </TabsContent>
+      </Tabs>
+
+      <Button onClick={() => runExperiment()}>
+        Run Experiment
+      </Button>
+    </div>
+  );
+}
+```
+
+**2. Automated Prompt Optimization**
+
+```typescript
+// packages/ai/prompt-optimization/optimizer.ts
+import { Langfuse } from 'langfuse';
+
+export class PromptOptimizer {
+  async runOptimization(
+    promptName: string,
+    testDataset: DatasetItem[],
+    evaluationCriteria: EvaluationCriteria
+  ): Promise<OptimizationResult> {
+    
+    // 1. Get prompt variants from Langfuse
+    const variants = await this.langfuse.getPromptVersions(promptName);
+
+    // 2. Run each variant on test dataset
+    const results = await Promise.all(
+      variants.map(async variant => {
+        const outputs = await this.runVariantOnDataset(variant, testDataset);
+        
+        // 3. LLM-as-a-judge evaluates outputs
+        const scores = await this.evaluateOutputs(outputs, evaluationCriteria);
+        
+        return {
+          variant,
+          avgScore: scores.reduce((a, b) => a + b, 0) / scores.length,
+          outputs,
+          scores
+        };
+      })
+    );
+
+    // 4. Find best performing variant
+    const best = results.reduce((a, b) => 
+      a.avgScore > b.avgScore ? a : b
+    );
+
+    // 5. Log experiment to Langfuse
+    await this.langfuse.createExperiment({
+      name: `${promptName}-optimization`,
+      variants: results.map(r => ({
+        promptId: r.variant.id,
+        score: r.avgScore
+      })),
+      winner: best.variant.id
+    });
+
+    return {
+      bestVariant: best.variant,
+      improvements: best.avgScore - results[0].avgScore,
+      allResults: results
+    };
+  }
+
+  private async evaluateOutputs(
+    outputs: string[],
+    criteria: EvaluationCriteria
+  ): Promise<number[]> {
+    // Use LLM-as-a-judge for quality evaluation
+    const evaluator = new ChatOpenAI({ model: 'gpt-4o' });
+
+    return Promise.all(
+      outputs.map(async output => {
+        const evaluation = await evaluator.invoke([
+          {
+            role: 'system',
+            content: `You are evaluating video generation prompts.
+              Score from 0-1 based on: ${criteria.description}`
+          },
+          {
+            role: 'user',
+            content: `Output to evaluate: ${output}\n\nScore:`
+          }
+        ]);
+
+        return parseFloat(evaluation.content);
+      })
+    );
+  }
+}
+```
+
+**3. Workflow Template Marketplace**
+
+```typescript
+// apps/web/src/app/marketplace/page.tsx
+export default function MarketplacePage() {
+  const { data: templates } = useQuery({
+    queryKey: ['marketplace-templates'],
+    queryFn: () => fetch('/api/marketplace/templates').then(r => r.json())
+  });
+
+  return (
+    <div className="container py-8">
+      <h1 className="text-3xl font-bold mb-6">Workflow Marketplace</h1>
+      
+      <div className="grid md:grid-cols-3 gap-6">
+        {templates?.map(template => (
+          <WorkflowCard
+            key={template.id}
+            name={template.name}
+            description={template.description}
+            promptVersion={template.langfusePromptId}  {/* Reference to Langfuse */}
+            qualityScore={template.avgQualityScore}
+            usageCount={template.usageCount}
+            onInstall={() => installTemplate(template)}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// API endpoint
+// apps/web/src/app/api/marketplace/templates/route.ts
+export async function GET() {
+  // Fetch templates with Langfuse prompt references
+  const templates = await db.workflowTemplates.findMany({
+    where: { isPublic: true },
+    include: {
+      creator: true,
+      promptCache: true  // Includes Langfuse prompt ID
+    },
+    orderBy: { avgQualityScore: 'desc' }
+  });
+
+  return NextResponse.json(templates);
+}
+```
+
+### 4.5.3 Clear Separation of Concerns
+
+**Langfuse Responsibilities:**
+- ✅ All prompt templates (ComfyUI, agents, direct models)
+- ✅ Version control and A/B testing
+- ✅ Experiment tracking and evaluations
+- ✅ Developer telemetry and agent tracing
+
+**PostgreSQL Responsibilities:**
+- ✅ Workflow metadata and relationships
+- ✅ Job queue and execution status
+- ✅ User projects and production data
+- ✅ Approval gates and human review
+- ✅ Prompt metadata cache (references to Langfuse)
+
+**IndexedDB Responsibilities:**
+- ✅ Editor state and timeline data
+- ✅ Chat history and UI preferences
+- ✅ Offline-first capabilities
+
+### 4.5.4 Key Benefits
+
+**For Users:**
+- Systematically improve prompt quality through experimentation
+- Version control prevents losing successful prompts
+- Community-driven prompt templates accelerate workflow creation
+- Data-driven optimization (not guesswork)
+
+**For Platform:**
+- Unified observability across developer and user interactions
+- Monetization opportunity (premium prompt templates, analytics)
+- Competitive differentiation (prompt optimization as a feature)
+- Reduced support burden (users self-optimize)
+
+**For AI Quality:**
+- Continuous improvement through evaluation datasets
+- Automated regression testing for prompt changes
+- Cost optimization through prompt efficiency tracking
+- Brand safety through compliance evaluations
 
 ---
 
