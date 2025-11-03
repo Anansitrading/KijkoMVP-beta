@@ -8,6 +8,9 @@ const nextConfig: NextConfig = {
   reactStrictMode: true,
   productionBrowserSourceMaps: true,
   output: "standalone",
+  experimental: {
+    instrumentationHook: true,
+  },
   images: {
     remotePatterns: [
       {
