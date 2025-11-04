@@ -12,9 +12,10 @@ let telemetryInitialized = false;
 
 /**
  * Initialize Langfuse telemetry with OpenTelemetry
- * 
+ *
  * Call this once at application startup (e.g., in Next.js instrumentation.ts)
- * 
+ * Optimized for faster dev server startup - only logs in production
+ *
  * @example
  * ```ts
  * // instrumentation.ts
@@ -26,7 +27,6 @@ let telemetryInitialized = false;
 export function initializeLangfuseTelemetry(): void {
   // Prevent double initialization
   if (telemetryInitialized) {
-    console.log('[Langfuse] Telemetry already initialized');
     return;
   }
 
@@ -34,7 +34,10 @@ export function initializeLangfuseTelemetry(): void {
 
   // Skip initialization if Langfuse is disabled or not configured
   if (!config.enabled || !config.secretKey || !config.publicKey) {
-    console.log('[Langfuse] Telemetry disabled or not configured');
+    // Only log in production to reduce dev startup noise
+    if (process.env.NODE_ENV === 'production') {
+      console.log('[Langfuse] Telemetry disabled or not configured');
+    }
     return;
   }
 
@@ -42,10 +45,13 @@ export function initializeLangfuseTelemetry(): void {
     // Note: LangfuseSpanProcessor requires langfuse-node package
     // For now, we'll use the standard Langfuse SDK approach
     // OpenTelemetry integration can be added when using LangChain
-    
-    console.log('[Langfuse] Telemetry initialization skipped - using SDK approach');
-    console.log('[Langfuse] For LangChain integration, use CallbackHandler');
-    
+
+    // Only log in production to reduce dev startup overhead
+    if (process.env.NODE_ENV === 'production') {
+      console.log('[Langfuse] Telemetry initialization skipped - using SDK approach');
+      console.log('[Langfuse] For LangChain integration, use CallbackHandler');
+    }
+
     telemetryInitialized = true;
   } catch (error) {
     console.error('[Langfuse] Failed to initialize telemetry:', error);
